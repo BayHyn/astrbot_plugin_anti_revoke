@@ -7,6 +7,10 @@
       "type": "list",
       "description": "接收撤回提醒的目标QQ号或群号列表"
     },
+    "ignore_senders": {
+      "type": "list",
+      "description": "忽略这些QQ号的撤回消息"
+    },
     "cache_expiration_time": {
       "type": "int",
       "default": 300,
