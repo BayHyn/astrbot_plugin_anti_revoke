@@ -1,0 +1,15 @@
+{
+  "monitor_groups": {
+      "type": "list",
+      "description": "要监控撤回事件的群号列表"
+    },
+    "target_receivers": {
+      "type": "list",
+      "description": "接收撤回提醒的目标QQ号或群号列表"
+    },
+    "cache_expiration_time": {
+      "type": "int",
+      "default": 300,
+      "description": "消息缓存时间，单位: 秒 (默认5分钟)"
+    }
+}
