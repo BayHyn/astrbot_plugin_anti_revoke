@@ -5,7 +5,7 @@
     },
     "target_receivers": {
       "type": "list",
-      "description": "接收撤回提醒的目标QQ号或群号列表"
+      "description": "接收撤回提醒的目标QQ号"
     },
     "ignore_senders": {
       "type": "list",
