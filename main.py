@@ -170,7 +170,7 @@ class AntiRevoke(Star):
                 pickle.dump({
                     "message": message, 
                     "sender_id": event.get_sender_id(),
-                    "timestamp": event.message_obj.timestamp # <--- 新增缓存时间戳
+                    "timestamp": event.message_obj.timestamp
                 }, f)
             
             asyncio.create_task(delayed_delete(self.cache_expiration_time, file_path))
@@ -248,7 +248,13 @@ class AntiRevoke(Star):
 
                         try:
                             member_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(sender_id))
-                            member_nickname = member_info.get('card', member_info.get('nickname', member_nickname))
+                            card = member_info.get('card', '')
+                            nickname = member_info.get('nickname', '')
+
+                            if card:
+                                member_nickname = card
+                            elif nickname:
+                                member_nickname = nickname
                         except Exception:
                             pass
                         
