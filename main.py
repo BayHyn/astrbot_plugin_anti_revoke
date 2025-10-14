@@ -2,11 +2,13 @@ import asyncio
 import time
 import pickle
 import traceback
+import json 
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 import aiohttp
 import os 
 from astrbot.api import logger
+from astrbot.api import AstrBotConfig
 from astrbot.api.star import StarTools
 from astrbot.api import message_components as Comp
 from astrbot.api.star import Context, Star, register
@@ -14,6 +16,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.platform import MessageType
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+from aiocqhttp.exceptions import ActionFailed 
 
 
 def get_private_unified_msg_origin(user_id: str, platform: str = "aiocqhttp") -> str:
@@ -54,6 +57,23 @@ def get_value(obj, key, default=None):
         return getattr(obj, key, default)
     except Exception:
         return default
+
+def _serialize_components(components: list) -> str:
+    """将 Nakuru 组件列表序列化为 JSON 字符串，便于日志输出。"""
+    serialized_list = []
+    for comp in components:
+        try:
+            comp_dict = {k: v for k, v in comp.__dict__.items() if not k.startswith('_')}
+            comp_dict['type'] = getattr(comp.type, 'name', 'unknown')
+            serialized_list.append(comp_dict)
+        except:
+            serialized_list.append(f"<{str(comp)}>")
+
+    try:
+        return json.dumps(serialized_list, indent=2, ensure_ascii=False)
+    except:
+        return f"无法序列化: {str(serialized_list)}"
+
 
 async def _download_and_cache_image(session: aiohttp.ClientSession, component: Comp.Image, temp_path: Path) -> str:
     """
@@ -98,6 +118,40 @@ async def _download_and_cache_image(session: aiohttp.ClientSession, component: C
         if temp_file_path.exists():
             os.remove(temp_file_path)
         return None
+
+async def _process_component_and_get_gocq_part(
+    comp, session: aiohttp.ClientSession, temp_path: Path, local_files_to_cleanup: List[str]
+) -> List[Dict]:
+    """处理单个组件，返回其 Go-CQHTTP 消息段列表，并处理图片下载和清理。"""
+    
+    gocq_parts = []
+    comp_type_name = getattr(comp.type, 'name', 'unknown')
+
+    if comp_type_name in ['Plain', 'Text']:
+        text = getattr(comp, 'text', '')
+        if text:
+            # 文本
+            gocq_parts.append({"type": "text", "data": {"text": text}})
+    
+    elif comp_type_name == 'Face':
+        face_id = getattr(comp, 'id', None)
+        if face_id is not None:
+            # 表情：使用 Go-CQHTTP 要求的 Face 格式
+            gocq_parts.append({"type": "face", "data": {"id": int(face_id)}})
+    
+    elif comp_type_name == 'Image':
+        local_path = await _download_and_cache_image(session, comp, temp_path)
+        
+        if local_path:
+            # 图片
+            local_files_to_cleanup.append(local_path)
+            gocq_parts.append({"type": "image", "data": {"file": local_path}})
+        else:
+            gocq_parts.append({"type": "text", "data": {"text": "[图片转发失败]"}})
+
+    # 如果是其他类型 (At, Video, Record)，则返回空列表，由主循环记录到 unsupported_types
+    
+    return gocq_parts
 
 @register(
     "astrbot_plugin_anti_revoke",  # 插件ID
@@ -221,7 +275,6 @@ class AntiRevoke(Star):
                             logger.debug(f"[{self.instance_id}] 撤回消息发送者 {sender_id} 在白名单中，跳过转发。")
                             return None
                         
-                        # 获取并格式化时间戳
                         timestamp = cached_data.get("timestamp")
                         message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
 
@@ -251,14 +304,15 @@ class AntiRevoke(Star):
                             card = member_info.get('card', '')
                             nickname = member_info.get('nickname', '')
 
-                            if card:
+                            if card and card.strip():
                                 member_nickname = card
-                            elif nickname:
+                            elif nickname and nickname.strip():
                                 member_nickname = nickname
                         except Exception:
                             pass
                         
                         logger.info(f"[{self.instance_id}] 发现撤回。群: {group_name} ({group_id}), 发送者: {member_nickname} ({sender_id})")
+                        logger.info(f"[{self.instance_id}] 缓存消息组件 ({len(components)}个):\n{_serialize_components(components)}") # <--- 输出组件结构
 
                         
                         # 2. 循环发送 (单条消息)
@@ -269,8 +323,42 @@ class AntiRevoke(Star):
                                 # A. 构造最终的 Go-CQHTTP 消息段数组 (包含头部通知)
                                 gocq_content_array = []
                                 unsupported_types = set()
+                                
+                                # 用于缓存消息体中的文本和图片等消息段
+                                message_parts = []
 
-                                # 1. 构造通知头部 (纯文本)
+                                # 遍历组件并转换
+                                for comp in components:
+                                    comp_type_name = getattr(comp.type, 'name', 'unknown')
+                                    
+                                    if comp_type_name in ['Plain', 'Text', 'Image', 'Face']: # 包含 Face
+                                        # 使用辅助函数处理所有已支持的组件 (Plain, Face, Image)
+                                        converted_parts = await _process_component_and_get_gocq_part(
+                                            comp, session, self.temp_path, local_files_to_cleanup
+                                        )
+                                        message_parts.extend(converted_parts)
+                                    
+                                    else:
+                                        unsupported_types.add(comp_type_name)
+
+                                # 3. 在所有消息段前面插入昵称和冒号，只对第一个文本/图片消息段生效
+                                has_inserted_prefix = False
+                                final_message_parts = []
+                                for part in message_parts:
+                                    if not has_inserted_prefix and (part['type'] == 'text' or part['type'] == 'image' or part['type'] == 'face'):
+                                        # 对第一个非表情/文本/图片的消息段，插入昵称前缀
+                                        final_message_parts.append({"type": "text", "data": {"text": f"{member_nickname}："}})
+                                        has_inserted_prefix = True
+                                        
+                                        # 如果原本就是文本，需要确保昵称和文本内容在同一个消息段
+                                        if part['type'] == 'text':
+                                            final_message_parts[-1]['data']['text'] += part['data']['text']
+                                            continue # 跳过原始文本部分
+                                        
+                                    final_message_parts.append(part)
+                                
+                                
+                                # 4. 构造通知头部 (纯文本)
                                 notification_prefix = (
                                     f"【防撤回提醒】\n"
                                     f"群聊：{group_name} ({group_id})\n"
@@ -278,45 +366,25 @@ class AntiRevoke(Star):
                                     f"时间：{message_time_str}"
                                 )
                                 
-                                # 2. 遍历组件并转换
-                                for comp in components:
-                                    comp_type_name = getattr(comp.type, 'name', 'unknown')
-                                    
-                                    if comp_type_name in ['Plain', 'Text']:
-                                        text = getattr(comp, 'text', '')
-                                        if text:
-                                            text_with_prefix = f"{member_nickname}：{text}"
-                                            gocq_content_array.append({"type": "text", "data": {"text": text_with_prefix}})
-                                        
-                                    elif comp_type_name == 'Image':
-                                        local_path = await _download_and_cache_image(session, comp, self.temp_path)
-                                        
-                                        if local_path:
-                                            local_files_to_cleanup.append(local_path)
-                                            gocq_content_array.append({"type": "text", "data": {"text": f"{member_nickname}："}})
-                                            gocq_content_array.append({"type": "image", "data": {"file": local_path}})
-                                        else:
-                                            gocq_content_array.append({"type": "text", "data": {"text": "[图片转发失败]"}})
-                                    
-                                    else:
-                                        unsupported_types.add(comp_type_name)
-
-                                # 3. 在头部文本中添加不支持的组件警告
+                                # 5. 在头部文本中添加不支持的组件警告
                                 warning_text = ""
                                 if unsupported_types:
-                                    warning_text = f"\n⚠️ 注意：包含不支持的组件：{', '.join(unsupported_types)}"
+                                    warning_text = f"\n⚠️ 注意：包含无法转发组件：{', '.join(unsupported_types)}"
                                     final_prefix_text = f"{notification_prefix}{warning_text}"
                                 else:
-                                    final_prefix_text = f"{notification_prefix}{warning_text}\n--------------------\n"
+                                    final_prefix_text = f"{notification_prefix}\n--------------------\n"
+                                gocq_content_array.append({"type": "text", "data": {"text": final_prefix_text}})
                                 
-                                # 将头部通知插入到数组的最前面
-                                gocq_content_array.insert(0, {"type": "text", "data": {"text": final_prefix_text}})
+                                # 将处理后的消息段附加到头部通知之后
+                                gocq_content_array.extend(final_message_parts)
 
 
                                 # B. 执行发送 (单次调用)
                                 if gocq_content_array:
                                     try:
                                         logger.info(f"[{self.instance_id}] ➡️ 正在发送【合并消息】到：{target_id_str}")
+                                        
+                                        logger.info(f"[{self.instance_id}] Go-CQHTTP REQUEST BODY:\n{json.dumps(gocq_content_array, indent=2, ensure_ascii=False)}")
                                         
                                         await client.send_private_msg(
                                             user_id=int(target_id_str),
@@ -328,7 +396,6 @@ class AntiRevoke(Star):
                                         logger.error(f"[{self.instance_id}] ❌ 合并消息转发失败到 {target_id_str}：{e}")
                                         logger.error(traceback.format_exc())
 
-                        # **核心：在所有发送完成后，清理本地文件**
                         if local_files_to_cleanup:
                             asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
                             logger.info(f"已调度本地图片清理任务，共 {len(local_files_to_cleanup)} 个文件。")
