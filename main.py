@@ -248,6 +248,7 @@ class AntiRevoke(Star):
             message_obj = event.get_messages()
             timestamp_ms = int(time.time() * 1000)
             components = message_obj.components if isinstance(message_obj, MessageChain) else message_obj if isinstance(message_obj, list) else []
+            components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') != 'Reply']
             if not components: return None
 
             raw_file_names = []
