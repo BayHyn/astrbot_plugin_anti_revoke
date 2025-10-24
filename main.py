@@ -158,9 +158,6 @@ async def _process_component_and_get_gocq_part(
                 original_filename = Path(cached_file_path_str).name.split('_', 1)[1]
             except IndexError:
                 original_filename = Path(cached_file_path_str).name
-        
-        if getattr(comp, 'name', None):
-            original_filename = getattr(comp, 'name')
 
         if cached_file_path_str and Path(cached_file_path_str).exists():
             absolute_path = str(Path(cached_file_path_str).absolute())
